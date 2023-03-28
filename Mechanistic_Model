@@ -1,0 +1,1065 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import math
+from scipy.integrate import odeint
+from time import sleep
+
+zl  = 0.005
+dz  = 0.001
+z   = np.arange(0,zl+dz,dz)
+N   = len(z)
+
+run = 1
+
+## Monolith parameter
+s0      = 100E-6                    #m                  #washcoat thickness
+r0      = 510E-6 - s0               #m                  #channel radius 
+dm      = 0.106                     #m                  #diameter of monolith block   
+WpAc    = 2*r0/((r0+s0)**2 - r0**2) #m2/m3              #perimeter per volume of washcoat
+
+
+## Details of porous media (Assume parallel pore)
+re      = 12.00E-9                  #m                  #equivalent pore radius
+por     = 0.55                      #                   #Porosity
+tau     = 1                         #                   #Tortuosity
+LPt     = 2.0E-6/0.3                #mol(Pt)/g(wc)      #Active sites per catalyst/washcoat
+aBET    = 130                       #m2(wc)/g(wc)       #BET surface area
+H       = LPt/aBET                  #mol(pt)/m2(wc)     #mols of catalyst per surface area of washcoat
+rho_wc  = 1.3E6                     #g(wc)/m3(wc)       #bulk density of washcoat
+Av      = aBET*rho_wc               #m2(wc)/m3(wc)      #internal surface area per volume of washcoat
+Amon    = math.pi*(dm/2)**2;        #m2                 #cross section area of monolith slice
+V_slice = Amon*zl
+G       = 2.0573E-5 
+
+## Initial condition
+P       = 101300                    #Pa                 #pressure
+v0      = 2.4                       #m/s                #gas flow velocity
+Mflow   = 0.64
+
+## Other parameters
+Dh      = 1.20E-3
+ff      = 1
+
+## Constant
+Rg      = 8.3144621
+
+
+def parameter(y0):
+    for i in range(0,N):
+        YA[i]    = y0[i]
+        YB[i]    = y0[i+N]
+        YC[i]    = y0[i+2*N]
+        YAs[i]   = y0[i+3*N]
+        YBs[i]   = y0[i+4*N]
+        YCs[i]   = y0[i+5*N]
+        fcV[i]   = y0[i+6*N]
+        fcCO[i]  = y0[i+7*N]
+        fcO[i]   = y0[i+8*N]
+        fcOO[i]  = y0[i+9*N]
+        Tg[i]    = y0[i+10*N]
+        Ts[i]    = y0[i+11*N]       
+        
+    v        = v0*Tg[:]/298
+    
+    ## Parameters
+    MCO     =28.01      #Molar mass of CO in kg/kmol
+    Mair    =28.96      #Molar mass of air in kg/kmol
+    MO2     =32.00      #Molar mass of oxygen in kg/kmol
+    MCO2    =44.01      #Molar mass of carbon dioxide in kg/kmol
+    MC3H8   =44.1       #Molar mass of propane in kg/kmol
+    VCO     =18.9       #Molecular volume of CO in m3/kmol in liq form at its b.p.
+    Vair    =20.1       #Molecular volume of air in m3/kmol in liq form at its b.p.
+    VCO2    =22.262     #Molecular volume of CO2 in m3/kmol in liq form at its b.p. (CHECK this in H&K)
+    VC3H8   =65.34      #Molecular volume of C3H8 in m3/kmol (est. from H&K pg 229)
+    
+    # Properties of gas phase
+    rho_air     = P*Mair/(1000*Rg*Tg[:])                                                        #kg/m3
+    Cp_air      = (28.09 + 0.1965E-2*Tg[:] + 0.4799E-5*Tg[:]**2 - 1.965E-9*Tg[:]**3)/0.02896    #J/kg K
+    k_air       = 1.679E-2+5.073E-5*Tg[:]                                                       #W/mK       #thermal conductivity of air
+    Dt          = k_air[:]/(rho_air[:]*Cp_air[:])                                               #m2/s       #thermal diffusivity
+    Dg          = Dt[:]+(v[:]*r0)**2/(48*Dt[:])                                                 #m2/s       #thermal dispersion coefficient
+    
+    # Properties of solid phase
+    rho_s       = rho_wc/1000                                                                   #kg/m3
+    Cp_s        = 948 + 0.2268*Ts[:]                                                            #J/kg K
+    k_s         = 0.9558 - 2.09E-4*Ts[:]                                                        #W/mK       #solid thermal conductivity
+    Ds          = k_s[:]/(rho_s*Cp_s[:])                                                        #m2/s       #thermal diffusivity
+    
+    ## Heat transfer coefficient
+    mu          = 7.701E-6 + 4.166E-8*Tg[:] - 7.531E-12*Tg[:]**2                                #Pa.s       #viscosity                      #from H&K pg.323 & 660
+    Rey         = rho_air[:]*v0*Dh/mu[:]                                                        #           #Local Reynolds Number    
+    Pr          = Cp_air[:]*mu[:]/k_air[:]                                                      #           #Prandtl Number for air         #pg. 315
+    L           = np.copy(z)                                                                    #           #distance from inlet
+    Gz          = Rey[1:]*Pr[1:]*Dh/L[1:]                                                       #           #Graetz Number
+    NuT         = 3.657 + 8.827*(1000/Gz[:])**-0.545*np.exp(-48.2/Gz[:])                        #           #Nu for constant wall temperature
+    NuH         = 4.364 + 13.18*(1000/Gz[:])**-0.524*np.exp(-60.2/Gz[:])                        #           #Nu for constant wall flux
+    Nu          = ((NuT[:]+NuH[:])/2)+1                                                         #           #Nusselt number
+    h           = Nu[:]*k_air[1:]/Dh                                                            #           #heat transfer coefficient   
+    h           = np.append([0],h )                                                             # [0] to maintain shape of array  
+    
+    ## Mass transfer coefficient 
+    Sh          = Nu[:]                                                                         #           #Sherwood number (assume mass-heat transfer analogy)                                                                               
+    Sh          = np.append([0],Sh)                                                             # [0] to maintain shape of array                                                             
+       
+       #Bulk Diffusion coefficient (gas)
+    DbA=(1.013e-2*Tg[:]**(7/4)*((1/MCO)+(1/Mair))**(1/2))/(P*(VCO**(1/3)+Vair**(1/3))**2)
+    DbB=(1.013e-2*Tg[:]**(7/4)*((1/MCO2)+(1/Mair))**(1/2))/(P*(VCO2**(1/3)+Vair**(1/3))**2)
+    DbC=(1.013e-2*Tg[:]**(7/4)*((1/MC3H8)+(1/Mair))**(1/2))/(P*(VC3H8**(1/3)+Vair**(1/3))**2)                                   
+    
+        #Dispersion coefficient
+    DiA=DbA[:]+(v[:]*r0)**2/(48*DbA[:])
+    DiB=DbB[:]+(v[:]*r0)**2/(48*DbB[:])     
+    DiC=DbC[:]+(v[:]*r0)**2/(48*DbC[:])                                   
+    
+        #Convective mass transfer coefficient    
+    kmA         = Sh[:]*DbA[:]/Dh 
+    kmB         = Sh[:]*DbB[:]/Dh
+    kmC         = Sh[:]*DbC[:]/Dh
+    
+        #Knudsen diffusion coefficient
+    DkA=97*re*(Ts[:]/MCO  )**0.5
+    DkB=97*re*(Ts[:]/MCO2 )**0.5          
+    DkC=97*re*(Ts[:]/MC3H8)**0.5
+    
+        #Bulk Diffusion coefficient (solid)
+    DbAs=(1.013e-2*Ts[:]**1.75*((1/MCO)+(1/Mair))**(1/2))/(P*(VCO**(1/3)+Vair**(1/3))**2)
+    DbBs=(1.013e-2*Ts[:]**1.75*((1/MCO2)+(1/Mair))**(1/2))/(P*(VCO2**(1/3)+Vair**(1/3))**2)
+    DbCs=(1.013e-2*Ts[:]**1.75*((1/MC3H8)+(1/Mair))**(1/2))/(P*(VC3H8**(1/3)+Vair**(1/3))**2)      
+    
+        #Diffusion coefficient in the pores
+    DvA=1/(1/DbAs[:]+1/DkA[:])
+    DvB=1/(1/DbBs[:]+1/DkB[:])
+    DvC=1/(1/DbCs[:]+1/DkC[:])
+    
+        #Effective diffusivity
+    DeA=ff*por*DvA[:]/tau                  
+    DeB=ff*por*DvB[:]/tau                             
+    DeC=ff*por*DvC[:]/tau
+    
+    ## Reaction parameter
+    # Rxn a
+    S_CO = 0.85*(1-fcCO[:])/(1-0.85*fcCO[:])
+    EaB = -126.4 + 33*fcCO[:]
+    AaB = 1.0E8
+    # Rxn b
+    S_O2 = 0.15
+    # Rxn c
+    EcF = -104.6 + 46.024*fcCO[:]
+    AcF = 8.2E8
+    # Rxn d
+    EdF = -50
+    AdF = 1.0E8 #0
+    # Rxn e
+    EeF = -115
+    AeF = 1.0E15 #0
+    # Rxn f
+    EfF = -105
+    AfF = 1.0E15
+    # Propane rxn
+    Ahc = 3.0E12
+    EC3H8 = -1.08E4
+    Ahci = 0.208
+    EC3H8i = 380
+    
+    ## Elementary reaction
+    Ra = (S_CO[:]/(G*Rg*Ts[:])*P*YAs[:]*fcV[:]*((Rg*1000*Ts[:])/(2*math.pi*MCO))**0.5 - AaB*fcCO[:]*np.exp((EaB[:]*1000)/(Rg*Ts[:])))
+    Rb = 2*S_O2/(G*Rg*Ts[:])*P*YO2*fcV[:]**2*((Rg*1000*Ts[:])/(2*math.pi*MO2))**0.5
+    Rc = AcF*fcCO[:]*fcO[:]*np.exp((EcF[:]*1000)/(Rg*Ts[:]))
+    Rd = AdF/(Rg*Ts[:])*P*YAs[:]*fcO[:]**2*np.exp((EdF*1000)/(Rg*Ts[:])) #shut down AdF=0
+    Re = AeF*fcCO[:]*fcOO[:]*np.exp((EeF*1000)/(Rg*Ts[:]))              #shut down AeF=0
+    Rf = AfF*fcOO[:]*fcV[:]*np.exp((EfF*1000)/(Rg*Ts[:]))
+    
+    ## Molecular desorption rate
+    RCO     = -Ra -Rd
+   #RO2     = -Rb
+    RCO2    = Rc + Re
+    
+    ## Propane reaction rate
+    RC3H8i  = (1 + Ahci*YAs[:]*np.exp(EC3H8i/Ts[:]))**2
+    RC3H8   = Ahc*YO2*YAs[:]*np.exp(EC3H8/Ts[:])/RC3H8i
+    
+    ## Heat of Reaction
+    HrCO    = -282.55e3
+    HrC3H8  = -2.059E6 + 72.3*Ts[:] - 9.69E-2*Ts[:]**2 + 4.34E-5*Ts[:]**3 + 7.56E-9*Ts[:]**4
+    
+    return np.concatenate([v,
+                          DiA,DiB,DiC,
+                          kmA,kmB,kmC,
+                          DeA,DeB,DeC,
+                          Dg,Ds,
+                          h,
+                          rho_air,
+                          Cp_air,Cp_s,
+                          Ra,Rb,Rc,Rd,Re,Rf,
+                          RCO,RCO2,RC3H8,
+                          HrC3H8,[HrCO],
+                          [rho_s]])
+
+def model(y0,t):
+    for i in range(0,N):
+        YA[i]    = y0[i]
+        YB[i]    = y0[i+N]
+        YC[i]    = y0[i+2*N]
+        YAs[i]   = y0[i+3*N]
+        YBs[i]   = y0[i+4*N]
+        YCs[i]   = y0[i+5*N]
+        fcV[i]   = y0[i+6*N]
+        fcCO[i]  = y0[i+7*N]
+        fcO[i]   = y0[i+8*N]
+        fcOO[i]  = y0[i+9*N]
+        Tg[i]    = y0[i+10*N]
+        Ts[i]    = y0[i+11*N]
+        
+        v        = v0*Tg[:]/298
+    
+    ## Parameters
+    MCO     =28.01      #Molar mass of CO in kg/kmol
+    Mair    =28.96      #Molar mass of air in kg/kmol
+    MO2     =32.00      #Molar mass of oxygen in kg/kmol
+    MCO2    =44.01      #Molar mass of carbon dioxide in kg/kmol
+    MC3H8   =44.1       #Molar mass of propane in kg/kmol
+    VCO     =18.9       #Molecular volume of CO in m3/kmol in liq form at its b.p.
+    Vair    =20.1       #Molecular volume of air in m3/kmol in liq form at its b.p.
+    VCO2    =22.262     #Molecular volume of CO2 in m3/kmol in liq form at its b.p. (CHECK this in H&K)
+    VC3H8   =65.34      #Molecular volume of C3H8 in m3/kmol (est. from H&K pg 229)
+    
+    # Properties of gas phase
+    rho_air     = P*Mair/(1000*Rg*Tg[:])                                                        #kg/m3
+    Cp_air      = (28.09 + 0.1965E-2*Tg[:] + 0.4799E-5*Tg[:]**2 - 1.965E-9*Tg[:]**3)/0.02896    #J/kg K
+    k_air       = 1.679E-2+5.073E-5*Tg[:]                                                       #W/mK      #thermal conductivity of air
+    Dt          = k_air[:]/(rho_air[:]*Cp_air[:])                                               #m2/s      #thermal diffusivity
+    Dg          = Dt[:]+(v[:]*r0)**2/(48*Dt[:])                                                 #m2/s      #thermal dispersion coefficient
+    
+    # Properties of solid phase
+    rho_s       = rho_wc/1000                                                                   #kg/m3
+    Cp_s        = 948 + 0.2268*Ts[:]                                                            #J/kg K
+    k_s         = 0.9558 - 2.09E-4*Ts[:]                                                        #W/mK       #solid thermal conductivity
+    Ds          = k_s[:]/(rho_s*Cp_s[:])                                                        #m2/s       #thermal diffusivity
+    
+    ## Heat transfer coefficient
+    mu          = 7.701E-6 + 4.166E-8*Tg[:] - 7.531E-12*Tg[:]**2                                #Pa.s       #viscosity                      #from H&K pg.323 & 660
+    Rey         = rho_air[:]*v0*Dh/mu[:]                                                        #           #Local Reynolds Number    
+    Pr          = Cp_air[:]*mu[:]/k_air[:]                                                      #           #Prandtl Number for air         #pg. 315
+    L           = np.copy(z)                                                                    #           #distance from inlet
+    Gz          = Rey[1:]*Pr[1:]*Dh/L[1:]                                                       #           #Graetz Number
+    NuT         = 3.657 + 8.827*(1000/Gz[:])**-0.545*np.exp(-48.2/Gz[:])                        #           #Nu for constant wall temperature
+    NuH         = 4.364 + 13.18*(1000/Gz[:])**-0.524*np.exp(-60.2/Gz[:])                        #           #Nu for constant wall flux
+    Nu          = ((NuT[:]+NuH[:])/2)+1                                                         #           #Nusselt number
+    h           = Nu[:]*k_air[1:]/Dh                                                            #           #heat transfer coefficient   
+    h           = np.append([0],h )                                                             # [0] to maintain shape of array  
+    
+    ## Mass transfer coefficient 
+    Sh          = Nu[:]                                                                         #           #Sherwood number (assume mass-heat transfer analogy)                                                                               
+    Sh          = np.append([0],Sh)                                                             # [0] to maintain shape of array                                                             
+       
+       #Bulk Diffusion coefficient (gas)
+    DbA=(1.013e-2*Tg[:]**(7/4)*((1/MCO)+(1/Mair))**(1/2))/(P*(VCO**(1/3)+Vair**(1/3))**2)
+    DbB=(1.013e-2*Tg[:]**(7/4)*((1/MCO2)+(1/Mair))**(1/2))/(P*(VCO2**(1/3)+Vair**(1/3))**2)
+    DbC=(1.013e-2*Tg[:]**(7/4)*((1/MC3H8)+(1/Mair))**(1/2))/(P*(VC3H8**(1/3)+Vair**(1/3))**2)                                   
+    
+        #Dispersion coefficient
+    DiA=(DbA[:]+(v[:]*r0)**2/(48*DbA[:]))
+    DiB=(DbB[:]+(v[:]*r0)**2/(48*DbB[:]))     
+    DiC=(DbC[:]+(v[:]*r0)**2/(48*DbC[:]))                                   
+    
+        #Convective mass transfer coefficient    
+    kmA         = Sh[:]*DbA[:]/Dh 
+    kmB         = Sh[:]*DbB[:]/Dh
+    kmC         = Sh[:]*DbC[:]/Dh
+    
+        #Knudsen diffusion coefficient
+    DkA=97*re*(Ts[:]/MCO  )**0.5
+    DkB=97*re*(Ts[:]/MCO2 )**0.5          
+    DkC=97*re*(Ts[:]/MC3H8)**0.5
+    
+        #Bulk Diffusion coefficient (solid)
+    DbAs=(1.013e-2*Ts[:]**1.75*((1/MCO)+(1/Mair))**(1/2))/(P*(VCO**(1/3)+Vair**(1/3))**2)
+    DbBs=(1.013e-2*Ts[:]**1.75*((1/MCO2)+(1/Mair))**(1/2))/(P*(VCO2**(1/3)+Vair**(1/3))**2)
+    DbCs=(1.013e-2*Ts[:]**1.75*((1/MC3H8)+(1/Mair))**(1/2))/(P*(VC3H8**(1/3)+Vair**(1/3))**2)      
+    
+        #Diffusion coefficient in the pores
+    DvA=1/(1/DbAs[:]+1/DkA[:])
+    DvB=1/(1/DbBs[:]+1/DkB[:])
+    DvC=1/(1/DbCs[:]+1/DkC[:])
+    
+        #Effective diffusivity
+    DeA=ff*por*DvA[:]/tau                  
+    DeB=ff*por*DvB[:]/tau                             
+    DeC=ff*por*DvC[:]/tau
+    
+    ## Reaction parameter
+    # Rxn a
+    S_CO = 0.85*(1-fcCO[:])/(1-0.85*fcCO[:])
+    EaB = -126.4 + 33*fcCO[:]
+    AaB = 1.0E8
+    # Rxn b
+    S_O2 = 0.15
+    # Rxn c
+    EcF = -104.6 + 46.024*fcCO[:]
+    AcF = 8.2E8
+    # Rxn d
+    EdF = -50
+    AdF = 1.0E8 #0
+    # Rxn e
+    EeF = -115
+    AeF = 1.0E15 #0
+    # Rxn f
+    EfF = -105
+    AfF = 1.0E15
+    # Propane rxn
+    Ahc = 3.0E12
+    EC3H8 = -1.08E4
+    Ahci = 0.208
+    EC3H8i = 380
+    
+    ## Elementary reaction
+    Ra = (S_CO[:]/(G*Rg*Ts[:])*P*YAs[:]*fcV[:]*((Rg*1000*Ts[:])/(2*math.pi*MCO))**0.5 - AaB*fcCO[:]*np.exp((EaB[:]*1000)/(Rg*Ts[:])))
+    Rb = 2*S_O2/(G*Rg*Ts[:])*P*YO2*fcV[:]**2*((Rg*1000*Ts[:])/(2*math.pi*MO2))**0.5
+    Rc = AcF*fcCO[:]*fcO[:]*np.exp((EcF[:]*1000)/(Rg*Ts[:]))
+    Rd = AdF/(Rg*Ts[:])*P*YAs[:]*fcO[:]**2*np.exp((EdF*1000)/(Rg*Ts[:])) #shut down AdF=0
+    Re = AeF*fcCO[:]*fcOO[:]*np.exp((EeF*1000)/(Rg*Ts[:]))              #shut down AeF=0
+    Rf = AfF*fcOO[:]*fcV[:]*np.exp((EfF*1000)/(Rg*Ts[:]))
+    
+    ## Molecular desorption rate
+    RCO     = -Ra -Rd
+   #RO2     = -Rb
+    RCO2    = Rc + Re
+    
+    ## Propane reaction rate
+    RC3H8i  = (1 + Ahci*YCs[:]*np.exp(EC3H8i/Ts[:]))**2
+    RC3H8   = Ahc*YO2*YCs[:]*np.exp(EC3H8/Ts[:])/RC3H8i
+    
+    ## Heat of Reaction
+    HrCO    = -282.55e3
+    HrC3H8  = -2.059E6 + 72.3*Ts[:] - 9.69E-2*Ts[:]**2 + 4.34E-5*Ts[:]**3 + 7.56E-9*Ts[:]**4
+    
+    ## Differential equation
+    # Gas phase
+    YAt         = -v[1:-1]*np.diff(YA[:-1])/dz + DiA[1:-1]*((YA[2:]-2*YA[1:-1]+YA[:-2])/dz**2) - 4/Dh*kmA[1:-1]*(YA[1:-1]-YAs[1:-1])
+    YBt         = -v[1:-1]*np.diff(YB[:-1])/dz + DiB[1:-1]*((YB[2:]-2*YB[1:-1]+YB[:-2])/dz**2) - 4/Dh*kmB[1:-1]*(YB[1:-1]-YBs[1:-1])
+    YCt         = -v[1:-1]*np.diff(YC[:-1])/dz + DiC[1:-1]*((YC[2:]-2*YC[1:-1]+YC[:-2])/dz**2) - 4/Dh*kmC[1:-1]*(YC[1:-1]-YCs[1:-1])
+    
+    YAt_end     = -v[-1]*(YA[-1]-YA[-2]   )/dz + DiA[  -1]*((2*YA[-2]-2*YA[-1]        )/dz**2) - 4/Dh*kmA[  -1]*(YA[  -1]-YAs[  -1])   
+    YBt_end     = -v[-1]*(YB[-1]-YB[-2]   )/dz + DiB[  -1]*((2*YB[-2]-2*YB[-1]        )/dz**2) - 4/Dh*kmB[  -1]*(YB[  -1]-YBs[  -1]) 
+    YCt_end     = -v[-1]*(YC[-1]-YC[-2]   )/dz + DiC[  -1]*((2*YC[-2]-2*YC[-1]        )/dz**2) - 4/Dh*kmC[  -1]*(YC[  -1]-YCs[  -1])
+     
+    Tt          = -v[1:-1]*np.diff(Tg[:-1])/dz    + Dg[1:-1]*((Tg[2:]-2*Tg[1:-1]+Tg[:-2])/dz**2)        + 4/Dh*h[1:-1]/(rho_air[1:-1]*Cp_air[1:-1])*(Ts[1:-1]-Tg[1:-1])
+    Tt_end      = -v[  -1]*(Tg[-1]-Tg[-2] )/dz    + Dg[  -1]*((2*Tg[-2]-2*Tg[-1]        )/dz**2)        + 4/Dh*h[  -1]/(rho_air[  -1]*Cp_air[  -1])*(Ts[  -1]-Tg[  -1])
+    
+    # Solid washcoat
+    YAst     = 1/por*(kmA[1:-1]*(YA[1:-1]-YAs[1:-1])*WpAc + DeA[1:-1]*(YAs[2:]-2*YAs[1:-1]+YAs[:-2])/dz**2+RCO[1:-1]  *H*Av*Rg*Ts[1:-1]/P) 
+    YBst     = 1/por*(kmB[1:-1]*(YB[1:-1]-YBs[1:-1])*WpAc + DeB[1:-1]*(YBs[2:]-2*YBs[1:-1]+YBs[:-2])/dz**2+RCO2[1:-1] *H*Av*Rg*Ts[1:-1]/P)
+    YCst     = 1/por*(kmC[1:-1]*(YC[1:-1]-YCs[1:-1])*WpAc + DeC[1:-1]*(YCs[2:]-2*YCs[1:-1]+YCs[:-2])/dz**2-RC3H8[1:-1]*H*Av*Rg*Ts[1:-1]/P)
+    
+    YAst_end = 1/por*(kmA[-1]*(YA[-1]-YAs[-1])*WpAc       + DeA[  -1]*(2*YAs[-2]-2*YAs[-1]         )/dz**2+RCO[-1]  *H*Av*Rg*Ts[-1]/P) 
+    YBst_end = 1/por*(kmB[-1]*(YB[-1]-YBs[-1])*WpAc       + DeB[  -1]*(2*YBs[-2]-2*YBs[-1]         )/dz**2+RCO2[-1] *H*Av*Rg*Ts[-1]/P)
+    YCst_end = 1/por*(kmC[-1]*(YC[-1]-YCs[-1])*WpAc       + DeC[  -1]*(2*YCs[-2]-2*YCs[-1]         )/dz**2-RC3H8[-1]*H*Av*Rg*Ts[-1]/P)
+    
+    fcVt     = - Ra[1:] -2*Rb[1:] +2*Rc[1:] +Re[1:] -Rf[1:]
+    fcCOt    =   Ra[1:] -  Rc[1:] +  Rd[1:] -Re[1:]
+    fcOt     = 2*Rb[1:] -  Rc[1:] -2*Rd[1:] +Re[1:] +2*Rf[1:]
+    fcOOt    =   Rd[1:] -  Re[1:] -  Rf[1:]
+    
+    Tst      = - h[1:-1]*(Ts[1:-1]-Tg[1:-1])*WpAc/(rho_s*Cp_s[1:-1]) + Ds[1:-1]*((Ts[2:]-2*Ts[1:-1]+Ts[:-2])/dz**2) + (RCO[1:-1]*HrCO-RC3H8[1:-1]*HrC3H8[1:-1])*H*Av/(rho_s*Cp_s[1:-1])
+    Tst_end  = - h[  -1]*(Ts[-1]-Tg[-1]    )*WpAc/(rho_s*Cp_s[  -1]) + Ds[  -1]*((2*Ts[-2]-2*Ts[-1]        )/dz**2) + (RCO[  -1]*HrCO-RC3H8[  -1]*HrC3H8[  -1])*H*Av/(rho_s*Cp_s[  -1])
+    
+    D = np.concatenate([[0],YAt,[YAt_end],
+                        [0],YBt,[YBt_end],
+                        [0],YCt,[YCt_end],
+                        [0],YAst,[YAst_end],
+                        [0],YBst,[YBst_end],
+                        [0],YCst,[YCst_end],
+                        [0],fcVt,
+                        [0],fcCOt,
+                        [0],fcOt,
+                        [0],fcOOt,
+                        [mp],Tt,[Tt_end],
+                        [0],Tst,[Tst_end]])    
+    
+    #D        = np.append([0], YAt      )
+    #D        = np.append( D ,[YAt_end ]) 
+    #D        = np.append( D ,[0       ])
+    #D        = np.append( D , YBt      )
+    #D        = np.append( D ,[YBt_end ])
+    #D        = np.append( D ,[0       ])
+    #D        = np.append( D , YCt      )
+    #D        = np.append( D ,[YCt_end ])
+    #D        = np.append( D ,[0       ])
+    #D        = np.append( D , YAst     )
+    #D        = np.append( D ,[YAst_end])
+    #D        = np.append( D ,[0       ])
+    #D        = np.append( D , YBst     )
+    #D        = np.append( D ,[YBst_end])
+    #D        = np.append( D ,[0       ])
+    #D        = np.append( D , YCst     )
+    #D        = np.append( D ,[YCst_end])
+    #D        = np.append( D ,[0       ])
+    #D        = np.append( D , fcVt     )
+    #D        = np.append( D ,[0       ])
+    #D        = np.append( D , fcCOt    )
+    #D        = np.append( D ,[0       ])
+    #D        = np.append( D , fcOt     )
+    #D        = np.append( D ,[0       ])
+    #D        = np.append( D , fcOOt    )
+    #D        = np.append( D ,[0       ])
+    #D        = np.append( D , Tt       )
+    #D        = np.append( D ,[Tt_end  ])
+    #D        = np.append( D ,[0       ])
+    #D        = np.append( D , Tst      )
+    #D        = np.append( D ,[Tst_end ])
+                
+    return D
+    
+YO2     = 0.0933
+
+YA      = np.ones(N)*3000E-6
+YAs     = np.ones(N)*3000E-6
+    
+YB      = np.zeros(N)
+YBs     = np.zeros(N)
+   
+YC      = np.ones(N)*500E-6
+YCs     = np.ones(N)*500E-6 
+    
+fcV     = np.ones(N)*0.00272
+fcCO    = np.ones(N)*0.99228
+fcO     = np.ones(N)*0.005
+fcOO    = np.ones(N)*0.000
+        
+Tg      = np.ones(N)*417
+Ts      = np.ones(N)*417
+
+start   = 0    
+
+dr_st   = np.zeros(6) 
+dr_st[0]= 200.0
+dr_st[1]= 500.0
+dr_st[2]= 300.0
+dr_st[3]= 100.0
+dr_st[4]= 200.0
+dr_st[5]= 500.0
+
+stage   = np.zeros(len(dr_st)+1)
+stage[0]= start
+for a in range(0,len(stage)-1):
+    stage[a+1] = stage[a] + dr_st[a]
+
+T_st    = np.zeros(len(stage))
+T_st[0] = Tg[0]
+T_st[1] = 505.0
+T_st[2] = 545.0
+T_st[3] = 545.0
+T_st[4] = 485.0
+T_st[5] = 445.0
+T_st[6] = 417.0
+
+dt      = 1#E-6
+
+for i in range(0,len(stage)-1):
+    if i == 0:
+        YA_save     = np.copy(YA[:]  )
+        YB_save     = np.copy(YB[:]  )
+        YC_save     = np.copy(YC[:]  )
+        YAs_save    = np.copy(YAs[:] )
+        YBs_save    = np.copy(YBs[:] )
+        YCs_save    = np.copy(YCs[:] )
+        fcV_save    = np.copy(fcV[:] )
+        fcCO_save   = np.copy(fcCO[:])
+        fcO_save    = np.copy(fcO[:] )
+        fcOO_save   = np.copy(fcOO[:])
+        Tg_save     = np.copy(Tg[:]  )
+        Ts_save     = np.copy(Ts[:]  )         
+        
+        time_no = 1
+        check   = 0
+        
+    mp      = (T_st[i+1]-T_st[i])/(dr_st[i]/dt)        
+       
+    if mp == 0:
+        time    = np.linspace(stage[i],stage[i+1],2)
+    else:
+        time    = np.linspace(stage[i],stage[i+1],round((dr_st[i]/dt)+1))
+            
+    if mp < 0 and check == 0:
+        phase1  = time_no
+        check   = 1
+        
+    for j in range(0,len(time)-1):
+        time_minor = np.linspace(time[j],time[j+1],round((time[j+1]-time[j])/dt + 1)) #for each temperature step
+         
+        y0 = np.concatenate([YA,YB,YC,YAs,YBs,YCs,fcV,fcCO,fcO,fcOO,Tg,Ts])
+        
+        value = parameter(y0)
+            
+        #v       = np.copy(value[   0:   N])
+        #DiA     = np.copy(value[   N: 2*N])
+        #DiB     = np.copy(value[ 2*N: 3*N])
+        #DiC     = np.copy(value[ 3*N: 4*N])
+        #kmA     = np.copy(value[ 4*N: 5*N])
+        #kmB     = np.copy(value[ 5*N: 6*N])
+        #kmC     = np.copy(value[ 6*N: 7*N])
+        #DeA     = np.copy(value[ 7*N: 8*N])
+        #DeB     = np.copy(value[ 8*N: 9*N])
+        #DeC     = np.copy(value[ 9*N:10*N])
+        #Dg      = np.copy(value[10*N:11*N])
+        #Ds      = np.copy(value[11*N:12*N])
+        #h       = np.copy(value[12*N:13*N])
+        #rho_air = np.copy(value[13*N:14*N])
+        #Cp_air  = np.copy(value[14*N:15*N])
+        #Cp_s    = np.copy(value[15*N:16*N])
+        Ra      = np.copy(value[16*N:17*N])
+        Rb      = np.copy(value[17*N:18*N])
+        Rc      = np.copy(value[18*N:19*N])
+        Rd      = np.copy(value[19*N:20*N])
+        Re      = np.copy(value[20*N:21*N])
+        Rf      = np.copy(value[21*N:22*N])
+        RCO     = np.copy(value[22*N:23*N])
+        RCO2    = np.copy(value[23*N:24*N])
+        RC3H8   = np.copy(value[24*N:25*N])
+        #HrC3H8  = np.copy(value[25*N:26*N])
+        #HrCO    =         value[26*N     ]
+        #rho_s   =         value[26*N+1   ]
+        
+        print 'Ra'      , Ra[1]     , Ra[-1]
+        print 'Rb'      , Rb[1]     , Rb[-1]
+        print 'Rc'      , Rc[1]     , Rc[-1]
+        print 'Rd'      , Rd[1]     , Rd[-1]
+        print 'Re'      , Re[1]     , Re[-1]
+        print 'Rf'      , Rf[1]     , Rf[-1]
+        print 'RCO'     , RCO[1]    , RCO[-1]
+        print 'RCO2'    , RCO2[1]   , RCO2[-1]
+        print 'RC3H8'   , RC3H8[1]  , RC3H8[-1]
+        #print 'HrC3H8'  , HrC3H8[1] , HrC3H8[-1]
+            
+        ## save initial parameter value for graph plotting
+        if i == 0 and j == 0:
+            Ra_save = np.copy(Ra[:])
+            Rb_save = np.copy(Rb[:])
+            Rc_save = np.copy(Rc[:])
+            Rd_save = np.copy(Rd[:])
+            Re_save = np.copy(Re[:])
+            Rf_save = np.copy(Rf[:])
+        else:
+            Ra_save     = np.append(Ra_save,  Ra[:])
+            Rb_save     = np.append(Rb_save,  Rb[:])
+            Rc_save     = np.append(Rc_save,  Rc[:])
+            Rd_save     = np.append(Rd_save,  Rd[:])
+            Re_save     = np.append(Re_save,  Re[:])
+            Rf_save     = np.append(Rf_save,  Rf[:])
+        
+        sol = odeint(model,y0,time_minor)
+        
+        #Tg[0]   += dt*mp
+        if mp == 0:
+            time_no += len(time_minor)-1
+            
+            for k in range(1,len(time_minor)-1):                         
+                YA_save     = np.append(YA_save,  sol[k,    :   N])
+                YB_save     = np.append(YB_save,  sol[k,   N: 2*N])
+                YC_save     = np.append(YC_save,  sol[k, 2*N: 3*N])
+                YAs_save    = np.append(YAs_save, sol[k, 3*N: 4*N])
+                YBs_save    = np.append(YBs_save, sol[k, 4*N: 5*N])
+                YCs_save    = np.append(YCs_save, sol[k, 5*N: 6*N])
+                fcV_save    = np.append(fcV_save, sol[k, 6*N: 7*N])
+                fcCO_save   = np.append(fcCO_save,sol[k, 7*N: 8*N])
+                fcO_save    = np.append(fcO_save, sol[k, 8*N: 9*N])
+                fcOO_save   = np.append(fcOO_save,sol[k, 9*N:10*N])
+                Tg_save     = np.append(Tg_save,  sol[k,10*N:11*N])
+                Ts_save     = np.append(Ts_save,  sol[k,11*N:12*N])
+                
+                YA_00    = np.copy(sol[k,   0:   N])
+                YB_00    = np.copy(sol[k,   N: 2*N])
+                YC_00    = np.copy(sol[k, 2*N: 3*N])
+                YAs_00   = np.copy(sol[k, 3*N: 4*N])
+                YBs_00   = np.copy(sol[k, 4*N: 5*N])
+                YCs_00   = np.copy(sol[k, 5*N: 6*N])
+                fcV_00   = np.copy(sol[k, 6*N: 7*N])
+                fcCO_00  = np.copy(sol[k, 7*N: 8*N])
+                fcO_00   = np.copy(sol[k, 8*N: 9*N])
+                fcOO_00  = np.copy(sol[k, 9*N:10*N])
+                Tg_00    = np.copy(sol[k,10*N:11*N])
+                Ts_00    = np.copy(sol[k,11*N:12*N])
+                
+                y00 = np.concatenate([YA_00,YB_00,YC_00,YAs_00,YBs_00,YCs_00,fcV_00,fcCO_00,fcO_00,fcOO_00,Tg_00,Ts_00])
+                
+                value = parameter(y00)
+                
+                #v       = np.copy(value[   0:   N])
+                #DiA     = np.copy(value[   N: 2*N])
+                #DiB     = np.copy(value[ 2*N: 3*N])
+                #DiC     = np.copy(value[ 3*N: 4*N])
+                #kmA     = np.copy(value[ 4*N: 5*N])
+                #kmB     = np.copy(value[ 5*N: 6*N])
+                #kmC     = np.copy(value[ 6*N: 7*N])
+                #DeA     = np.copy(value[ 7*N: 8*N])
+                #DeB     = np.copy(value[ 8*N: 9*N])
+                #DeC     = np.copy(value[ 9*N:10*N])
+                #Dg      = np.copy(value[10*N:11*N])
+                #Ds      = np.copy(value[11*N:12*N])
+                #h       = np.copy(value[12*N:13*N])
+                #rho_air = np.copy(value[13*N:14*N])
+                #Cp_air  = np.copy(value[14*N:15*N])
+                #Cp_s    = np.copy(value[15*N:16*N])
+                Ra      = np.copy(value[16*N:17*N])
+                Rb      = np.copy(value[17*N:18*N])
+                Rc      = np.copy(value[18*N:19*N])
+                Rd      = np.copy(value[19*N:20*N])
+                Re      = np.copy(value[20*N:21*N])
+                Rf      = np.copy(value[21*N:22*N])
+                RCO     = np.copy(value[22*N:23*N])
+                RCO2    = np.copy(value[23*N:24*N])
+                RC3H8   = np.copy(value[24*N:25*N])
+                #HrC3H8  = np.copy(value[25*N:26*N])
+                #HrCO    =         value[26*N     ]
+                #rho_s   =         value[26*N+1   ]
+                
+                Ra_save     = np.append(Ra_save,  Ra[:])
+                Rb_save     = np.append(Rb_save,  Rb[:])
+                Rc_save     = np.append(Rc_save,  Rc[:])
+                Rd_save     = np.append(Rd_save,  Rd[:])
+                Re_save     = np.append(Re_save,  Re[:])
+                Rf_save     = np.append(Rf_save,  Rf[:])
+                 
+                print '/n'
+                print 'time'    , time_minor[k]
+                print 'YA'      , YA_00[0]     ,YA_00[-1]
+                print 'YB'      , YB_00[0]     ,YB_00[-1]
+                print 'YC'      , YC_00[0]     ,YC_00[-1]
+                print 'YAs'     , YAs_00[0]    ,YAs_00[-1]
+                print 'YBs'     , YBs_00[0]    ,YBs_00[-1]
+                print 'YCs'     , YCs_00[0]    ,YCs_00[-1]
+                print 'Tg'      , Tg_00[0]     ,Tg_00[-1]     
+                print 'Ts'      , Ts_00[0]     ,Ts_00[-1]
+                print 'fcV'     , fcV_00[0]    ,fcV_00[-1]
+                print 'fcCO'    , fcCO_00[0]   ,fcCO_00[-1]
+                print 'fcO'     , fcO_00[0]    ,fcO_00[-1]
+                print 'fcOO'    , fcOO_00[0]   ,fcOO_00[-1]
+                print 'mp'      , mp
+                print 'Ra'      , Ra[1]     , Ra[-1]
+                print 'Rb'      , Rb[1]     , Rb[-1]
+                print 'Rc'      , Rc[1]     , Rc[-1]
+                print 'Rd'      , Rd[1]     , Rd[-1]
+                print 'Re'      , Re[1]     , Re[-1]
+                print 'Rf'      , Rf[1]     , Rf[-1]
+                print 'RCO'     , RCO[1]    , RCO[-1]
+                print 'RCO2'    , RCO2[1]   , RCO2[-1]
+                print 'RC3H8'   , RC3H8[1]  , RC3H8[-1]
+                #print 'HrC3H8'  , HrC3H8[1] , HrC3H8[-1]
+                
+                #sleep(0.5)
+        
+        else:
+            time_no += 1
+            
+        ## Update value for next iteration
+        YA    = np.copy(sol[-1,   0:   N])
+        YB    = np.copy(sol[-1,   N: 2*N])
+        YC    = np.copy(sol[-1, 2*N: 3*N])
+        YAs   = np.copy(sol[-1, 3*N: 4*N])
+        YBs   = np.copy(sol[-1, 4*N: 5*N])
+        YCs   = np.copy(sol[-1, 5*N: 6*N])
+        fcV   = np.copy(sol[-1, 6*N: 7*N])
+        fcCO  = np.copy(sol[-1, 7*N: 8*N])
+        fcO   = np.copy(sol[-1, 8*N: 9*N])
+        fcOO  = np.copy(sol[-1, 9*N:10*N])
+        Tg    = np.copy(sol[-1,10*N:11*N])
+        Ts    = np.copy(sol[-1,11*N:12*N])
+        Ts[0] = np.copy(sol[-1,10*N])
+        
+        ## Save values for graph plotting
+        YA_save     = np.append(YA_save,  sol[-1,    :   N])
+        YB_save     = np.append(YB_save,  sol[-1,   N: 2*N])
+        YC_save     = np.append(YC_save,  sol[-1, 2*N: 3*N])
+        YAs_save    = np.append(YAs_save, sol[-1, 3*N: 4*N])
+        YBs_save    = np.append(YBs_save, sol[-1, 4*N: 5*N])
+        YCs_save    = np.append(YCs_save, sol[-1, 5*N: 6*N])
+        fcV_save    = np.append(fcV_save, sol[-1, 6*N: 7*N])
+        fcCO_save   = np.append(fcCO_save,sol[-1, 7*N: 8*N])
+        fcO_save    = np.append(fcO_save, sol[-1, 8*N: 9*N])
+        fcOO_save   = np.append(fcOO_save,sol[-1, 9*N:10*N])
+        Tg_save     = np.append(Tg_save,  sol[-1,10*N:11*N])
+        Ts_save     = np.append(Ts_save,  sol[-1,11*N:12*N])
+        
+        ## Display parameter
+        print '/n'
+        print 'time'    , time[j+1]
+        print 'YA'      , YA[0]     ,YA[-1]
+        print 'YB'      , YB[0]     ,YB[-1]
+        print 'YC'      , YC[0]     ,YC[-1]
+        print 'YAs'     , YAs[0]    ,YAs[-1]
+        print 'YBs'     , YBs[0]    ,YBs[-1]
+        print 'YCs'     , YCs[0]    ,YCs[-1]
+        print 'Tg'      , Tg[0]     ,Tg[-1]     
+        print 'Ts'      , Ts[0]     ,Ts[-1]
+        print 'fcV'     , fcV[0]    ,fcV[-1]
+        print 'fcCO'    , fcCO[0]   ,fcCO[-1]
+        print 'fcO'     , fcO[0]    ,fcO[-1]
+        print 'fcOO'    , fcOO[0]   ,fcOO[-1]
+        print 'mp'      , mp
+        #print 'Ra', len(Ra_save)
+
+duration = np.linspace(stage[0],stage[-1],round((stage[-1]-stage[0])/dt+1))
+
+run += 1
+
+np.savez('C:\Users\kim_y_000\Desktop\FYP\mechanistc.npz', 
+         YA         =YA_save, 
+         YB         =YB_save,
+         YC         =YC_save, 
+         YAs        =YAs_save,
+         YBs        =YBs_save, 
+         YCs        =YCs_save,
+         fcV        =fcV_save, 
+         fcCO       =fcCO_save,
+         fcO        =fcO_save,
+         fcOO       =fcOO_save,
+         Tg         =Tg_save, 
+         Ts         =Ts_save,
+         Ra         =Ra_save,
+         Rb         =Rb_save,
+         Rc         =Rc_save,
+         Rd         =Rd_save,
+         Re         =Re_save,
+         Rf         =Rf_save,
+         run        =run,
+         dr_st      =dr_st,
+         T_st       =T_st,
+         start      =start)
+         
+YA_graph    = np.reshape(YA_save,  (time_no,N))
+YB_graph    = np.reshape(YB_save,  (time_no,N))
+YC_graph    = np.reshape(YC_save,  (time_no,N))
+YAs_graph   = np.reshape(YAs_save, (time_no,N))
+YBs_graph   = np.reshape(YBs_save, (time_no,N))
+YCs_graph   = np.reshape(YCs_save, (time_no,N))
+fcV_graph   = np.reshape(fcV_save, (time_no,N))
+fcCO_graph  = np.reshape(fcCO_save,(time_no,N))
+fcO_graph   = np.reshape(fcO_save, (time_no,N))
+fcOO_graph  = np.reshape(fcOO_save,(time_no,N))
+Tg_graph    = np.reshape(Tg_save,  (time_no,N))
+Ts_graph    = np.reshape(Ts_save,  (time_no,N))
+Ra_graph    = np.reshape(Ra_save,  (time_no-1,N))
+Rb_graph    = np.reshape(Rb_save,  (time_no-1,N))
+Rc_graph    = np.reshape(Rc_save,  (time_no-1,N))
+Rd_graph    = np.reshape(Rd_save,  (time_no-1,N))
+Re_graph    = np.reshape(Re_save,  (time_no-1,N))
+Rf_graph    = np.reshape(Rf_save,  (time_no-1,N))
+
+## Reaction rate
+rCO             = Mflow*(np.ones(time_no)*YA[0]-YA_graph[:,-1])
+r2CO            = rCO/V_slice
+convCO          = (np.ones(time_no)*YA[0]-YA_graph[:,-1])/YA[0]
+
+rC3H8           = Mflow*(np.ones(time_no)*YC[0]-YC_graph[:,-1])
+r2C3H8          = rC3H8/V_slice
+convC3H8        = (np.ones(time_no)*YC[0]-YC_graph[:,-1])/YC[0]
+    
+plt.figure(1)
+
+plt.subplot(221)
+plt.plot(duration[:],Tg_graph[:,-1],label='gas temp')
+plt.plot(duration[:],Ts_graph[:,-1],label='solid temp',linestyle='--')
+plt.legend(fontsize='xx-small')
+plt.xlabel('time, s')
+#plt.ylabel('temperature, K')
+plt.title('outlet temperature')
+plt.grid()  
+plt.grid(which='minor',linestyle='-')
+
+plt.subplot(222)
+plt.plot(duration[:],(YA_graph[:,-1]),label='CO')
+plt.plot(duration[:],(YB_graph[:,-1]),label='CO2',linestyle='--')
+plt.legend(fontsize='xx-small')
+plt.xlabel('time, s')
+#plt.ylabel('mol frac.')
+plt.title('mol frac. at outlet')
+plt.grid()  
+plt.grid(which='minor',linestyle='-')
+
+plt.subplot(223)
+plt.plot(duration[:],(rCO[:]),label='CO')
+plt.plot(duration[:],(r2CO[:]),label='RCO/slice',linestyle='--')
+plt.legend(fontsize='xx-small')
+plt.xlabel('time, s')
+#plt.ylabel('rate, mol/m3s')
+plt.title('mol frac. at outlet')
+plt.grid()  
+plt.grid(which='minor',linestyle='-')
+
+plt.subplot(224)
+plt.plot(duration[:-1],(Ra_graph[:,3]),label='CO')
+plt.plot(duration[:-1],(Rb_graph[:,3]),label='O')
+plt.plot(duration[:-1],(Rc_graph[:,3]),label='LH')
+plt.plot(duration[:-1],(Rd_graph[:,3]),label='Compress')
+plt.legend(fontsize='xx-small')
+plt.xlabel('time, s')
+plt.ylabel('rate, mol/mols')
+plt.title('elementart reaction at point (2)')
+plt.grid()  
+plt.grid(which='minor',linestyle='-')
+
+
+plt.figure(2)
+
+plt.plot(duration[:],(convCO[:]),label='CO')
+plt.plot(duration[:],(convC3H8[:]),label='C3H8')
+plt.legend()
+plt.xlabel('time, s')
+plt.ylabel('conversion')
+plt.title('CO and C3H8 conversion')
+plt.grid()  
+plt.grid(which='minor',linestyle='-')
+
+
+plt.figure(3)
+
+plt.subplot(221)
+plt.plot(duration[:],(fcCO_graph[:,1]),label='(1)')
+plt.plot(duration[:],(fcCO_graph[:,2]),label='(2)',linestyle='--')
+plt.plot(duration[:],(fcCO_graph[:,3]),label='(3)',linestyle=':')
+plt.legend(loc=2,fontsize='xx-small')
+plt.xlabel('time, s')
+plt.ylabel('fcCO')
+plt.title('fractional coverage of CO at point (1),(2),(3)')
+plt.grid()  
+plt.grid(which='minor',linestyle='-')
+
+plt.subplot(222)
+plt.plot(duration[:],(fcO_graph[:,1]),label='(1)')
+plt.plot(duration[:],(fcO_graph[:,2]),label='(2)',linestyle='--')
+plt.plot(duration[:],(fcO_graph[:,3]),label='(3)',linestyle=':')
+plt.legend(loc=2,fontsize='xx-small')
+plt.xlabel('time, s')
+plt.ylabel('fcO')
+plt.title('fractional coverage of O at point (1),(2),(3)')
+plt.grid()  
+plt.grid(which='minor',linestyle='-')
+
+plt.subplot(223)
+plt.plot(duration[:],(fcOO_graph[:,1]),label='(1)')
+plt.plot(duration[:],(fcOO_graph[:,2]),label='(2)',linestyle='--')
+plt.plot(duration[:],(fcOO_graph[:,3]),label='(3)',linestyle=':')
+plt.legend(loc=2,fontsize='xx-small')
+plt.xlabel('time, s')
+plt.ylabel('fcOO')
+plt.title('fractional coverage of OO at point (1),(2),(3)')
+plt.grid()  
+plt.grid(which='minor',linestyle='-')
+
+plt.subplot(224)
+plt.plot(duration[:],(fcV_graph[:,1]),label='(1)')
+plt.plot(duration[:],(fcV_graph[:,2]),label='(2)',linestyle='--')
+plt.plot(duration[:],(fcV_graph[:,3]),label='(3)',linestyle=':')
+plt.legend(loc=2,fontsize='xx-small')
+plt.xlabel('time, s')
+plt.ylabel('fcV')
+plt.title('fractional coverage of vacant site at point (1),(2),(3)')
+plt.grid()  
+plt.grid(which='minor',linestyle='-')
+
+
+plt.figure(4)
+
+plt.plot(Ts_graph[      :phase1 ,2],(r2CO[      :phase1 ]),label='ignition')
+plt.plot(Ts_graph[phase1:       ,2],(r2CO[phase1:       ]),label='extinction')
+plt.legend()
+plt.xlabel('solid temperature, K')
+plt.ylabel('CO reaction rate, mol/m3s')
+plt.title('light-off hysteresis')
+plt.grid()  
+plt.grid(which='minor',linestyle='-')
+
+
+plt.figure(5)
+
+plt.plot(Ts_graph[      :phase1 ,2],(convCO[        :phase1 ]),label='ignition-solid')
+plt.plot(Tg_graph[      :phase1 ,0],(convCO[        :phase1 ]),label='ignition',linestyle='--')
+plt.plot(Ts_graph[      :phase1 ,1],(convCO[        :phase1 ]),label='(1,1)',linestyle='-.')
+plt.plot(Ts_graph[      :phase1 ,3],(convCO[        :phase1 ]),label='(3,3)',linestyle=':')
+
+plt.plot(Ts_graph[phase1:       ,2],(convCO[phase1  :       ]),label='extinction-solid')
+plt.plot(Tg_graph[phase1:       ,0],(convCO[phase1  :       ]),label='extinction',linestyle='--')
+plt.plot(Ts_graph[phase1:       ,1],(convCO[phase1  :       ]),label='(1,1)',linestyle='-.')
+plt.plot(Ts_graph[phase1:       ,3],(convCO[phase1  :       ]),label='(3,3)',linestyle=':')
+
+plt.legend()
+plt.xlabel('solid temperature, K')
+plt.ylabel('CO conversion')
+plt.title('light-off hysteresis')
+plt.grid()  
+plt.grid(which='minor',linestyle='-')
+
+
+plt.figure(6)
+
+plt.subplot(221)
+plt.plot(Ts_graph[      :phase1 ,2],(Ra_graph[      :phase1 ,2]),label='ignition')
+plt.plot(Ts_graph[phase1:-1     ,2],(Ra_graph[phase1:       ,2]),label='extinction')
+plt.legend(loc=2,fontsize='xx-small')
+plt.xlabel('solid temperature, K')
+plt.ylabel('Ra')
+plt.title('CO adsorption')
+plt.grid()  
+plt.grid(which='minor',linestyle='-')
+
+plt.subplot(222)
+plt.plot(Ts_graph[      :phase1 ,2],(Rb_graph[      :phase1 ,2]),label='ignition')
+plt.plot(Ts_graph[phase1:-1     ,2],(Rb_graph[phase1:       ,2]),label='extinction')
+plt.legend(loc=2,fontsize='xx-small')
+plt.xlabel('solid temperature, K')
+plt.ylabel('Rb')
+plt.title('O adsorption')
+plt.grid()  
+plt.grid(which='minor',linestyle='-')
+
+plt.subplot(223)
+plt.plot(Ts_graph[      :phase1 ,2],(Rc_graph[      :phase1 ,2]),label='ignition')
+plt.plot(Ts_graph[phase1:-1     ,2],(Rc_graph[phase1:       ,2]),label='extinction')
+plt.legend(loc=2,fontsize='xx-small')
+plt.xlabel('solid temperature, K')
+plt.ylabel('Rc')
+plt.title('L-H')
+plt.grid()  
+plt.grid(which='minor',linestyle='-')
+
+plt.subplot(224)
+plt.plot(Ts_graph[      :phase1 ,2],(Rd_graph[      :phase1 ,2]),label='ignition')
+plt.plot(Ts_graph[phase1:-1     ,2],(Rd_graph[phase1:       ,2]),label='extinction')
+plt.legend(loc=2,fontsize='xx-small')
+plt.xlabel('solid temperature, K')
+plt.ylabel('Rd')
+plt.title('Compression')
+plt.grid()  
+plt.grid(which='minor',linestyle='-')
+
+
+plt.figure(7)
+
+plt.subplot(221)
+plt.plot(Ts_graph[      :phase1 ,2],(fcCO_graph[      :phase1 ,2]),label='ignition')
+plt.plot(Ts_graph[phase1:       ,2],(fcCO_graph[phase1:       ,2]),label='extinction')
+plt.legend(loc=2,fontsize='xx-small')
+plt.xlabel('solid temperature, K')
+plt.ylabel('fcCO')
+plt.title('fractional coverage of CO at point (1),(2),(3)')
+plt.grid()  
+plt.grid(which='minor',linestyle='-')
+
+plt.subplot(222)
+plt.plot(Ts_graph[      :phase1 ,2],(fcO_graph[      :phase1 ,2]),label='ignition')
+plt.plot(Ts_graph[phase1:       ,2],(fcO_graph[phase1:       ,2]),label='extinction')
+plt.legend(loc=2,fontsize='xx-small')
+plt.xlabel('solid temperature, K')
+plt.ylabel('fcO')
+plt.title('fractional coverage of O at point (1),(2),(3)')
+plt.grid()  
+plt.grid(which='minor',linestyle='-')
+
+plt.subplot(223)
+plt.plot(Ts_graph[      :phase1 ,2],(fcOO_graph[      :phase1 ,2]),label='ignition')
+plt.plot(Ts_graph[phase1:       ,2],(fcOO_graph[phase1:       ,2]),label='extinction')
+plt.legend(loc=2,fontsize='xx-small')
+plt.xlabel('solid temperature, K')
+plt.ylabel('fcOO')
+plt.title('fractional coverage of OO at point (1),(2),(3)')
+plt.grid()  
+plt.grid(which='minor',linestyle='-')
+
+plt.subplot(224)
+plt.plot(Ts_graph[      :phase1 ,2],(fcV_graph[      :phase1 ,2]),label='ignition')
+plt.plot(Ts_graph[phase1:       ,2],(fcV_graph[phase1:       ,2]),label='extinction')
+plt.legend(loc=2,fontsize='xx-small')
+plt.xlabel('solid temperature, K')
+plt.ylabel('fcV')
+plt.title('fractional coverage of vacant site at point (1),(2),(3)')
+plt.grid()  
+plt.grid(which='minor',linestyle='-')
+
+
+plt.figure(8)
+
+plt.subplot(321)
+plt.plot(duration[:-1],(Ra_graph[:,3]))
+plt.xlabel('time, s')
+plt.ylabel('rate, mol/mols')
+plt.title('CO ads-des')
+plt.grid()  
+plt.grid(which='minor',linestyle='-')
+
+plt.subplot(322)
+plt.plot(duration[:-1],(Rb_graph[:,3]))
+plt.xlabel('time, s')
+plt.ylabel('rate, mol/mols')
+plt.title('O ads')
+plt.grid()  
+plt.grid(which='minor',linestyle='-')
+
+plt.subplot(323)
+plt.plot(duration[:-1],(Rc_graph[:,3]))
+plt.xlabel('time, s')
+plt.ylabel('rate, mol/mols')
+plt.title('L-H')
+plt.grid()  
+plt.grid(which='minor',linestyle='-')
+
+plt.subplot(324)
+plt.plot(duration[:-1],(Rd_graph[:,3]))
+plt.xlabel('time, s')
+plt.ylabel('rate, mol/mols')
+plt.title('compress')
+plt.grid()  
+plt.grid(which='minor',linestyle='-')
+
+plt.subplot(325)
+plt.plot(duration[:-1],(Re_graph[:,3]))
+plt.xlabel('time, s')
+plt.ylabel('rate, mol/mols')
+plt.title('L-H CO-OO')
+plt.grid()  
+plt.grid(which='minor',linestyle='-')
+
+plt.subplot(326)
+plt.plot(duration[:-1],(Rf_graph[:,3]))
+plt.xlabel('time, s')
+plt.ylabel('rate, mol/mols')
+plt.title('OO -> O')
+plt.grid()  
+plt.grid(which='minor',linestyle='-')
+
+
+plt.figure(9)
+plt.plot(Ts_graph[      :phase1 , 1],(YA_graph[      :phase1 , 1]),label='ignition:1')
+plt.plot(Ts_graph[phase1:       , 1],(YA_graph[phase1:       , 1]),label='extinction:1')
+
+plt.plot(Ts_graph[      :phase1 , 2],(YA_graph[      :phase1 , 2]),label='ignition:2',linestyle='--')
+plt.plot(Ts_graph[phase1:       , 2],(YA_graph[phase1:       , 2]),label='extinction:2',linestyle='--')
+
+plt.plot(Ts_graph[      :phase1 ,-1],(YA_graph[      :phase1 ,-1]),label='ignition:out',linestyle=':')
+plt.plot(Ts_graph[phase1:       ,-1],(YA_graph[phase1:       ,-1]),label='extinction:out',linestyle=':')
+
+plt.legend(loc=5)
+plt.xlabel('solid temperature, K')
+plt.ylabel('CO mol frac.')
+plt.title('gas phase CO conc. during light-off')
+plt.grid()  
+plt.grid(which='minor',linestyle='-')
+
+
+plt.figure(10)
+plt.plot(Ts_graph[      :phase1 , 1],(YAs_graph[      :phase1 , 1]),label='ignition:1')
+plt.plot(Ts_graph[phase1:       , 1],(YAs_graph[phase1:       , 1]),label='extinction:1')
+
+plt.plot(Ts_graph[      :phase1 , 2],(YAs_graph[      :phase1 , 2]),label='ignition:2',linestyle='--')
+plt.plot(Ts_graph[phase1:       , 2],(YAs_graph[phase1:       , 2]),label='extinction:2',linestyle='--')
+
+plt.plot(Ts_graph[      :phase1 ,-1],(YAs_graph[      :phase1 ,-1]),label='ignition:out',linestyle=':')
+plt.plot(Ts_graph[phase1:       ,-1],(YAs_graph[phase1:       ,-1]),label='extinction:out',linestyle=':')
+
+plt.legend(loc=5)
+plt.xlabel('solid temperature, K')
+plt.ylabel('CO mol frac.')
+plt.title('solid phase CO conc. during light-off')
+plt.grid()  
+plt.grid(which='minor',linestyle='-')
+
+plt.show()
